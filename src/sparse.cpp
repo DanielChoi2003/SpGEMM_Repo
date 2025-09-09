@@ -4,6 +4,9 @@
 #include <ygm/io/csv_parser.hpp>
 #include <ygm/container/bag.hpp>
 #include <fstream>
+#include <iostream>
+
+using std::cout, std::endl;
 
 
 struct Edge{
@@ -23,14 +26,26 @@ struct Edge{
     }
 };
 
-struct coordinate{
-    int row;
-    int col;
-};
+// struct coordinate{
+//     int row;
+//     int col;
+
+//     template <class Archive>
+//     void serialize( Archive & ar )
+//     {
+//         ar(row, col);
+//     }
+// };
 
 struct edge_info{
     int first_index = -1;
     int edge_count = 0;
+
+    template <class Archive>
+    void serialize( Archive & ar )
+    {
+        ar(first_index, edge_count);
+    }
 };
 
 using graph_type = ygm::container::map<int, edge_info>;
@@ -57,7 +72,7 @@ int main(int argc, char** argv){
 
     int Edge_num = 0;
     if(world.rank0()){ // parse the csv header to get the number of Edges
-        std::string header_file = "../data/matrix_data/as-caida-header.csv";
+        std::string header_file = "../data/matrix_data/testing-header.csv";
         std::ifstream header(header_file);
 
         if(!header.is_open()){
@@ -111,6 +126,7 @@ int main(int argc, char** argv){
         Edge ed = {row, col, value};
         bag_A.async_insert(ed);
     });
+    world.barrier();
 
     // matrix B data extraction
     ygm::container::bag<Edge> bag_B(world);
@@ -127,6 +143,7 @@ int main(int argc, char** argv){
         Edge ed = {row, col, value};
         bag_B.async_insert(ed);
     });
+    world.barrier();
 
 
     // Task 2: data storage and sharing among ranks
@@ -139,6 +156,9 @@ int main(int argc, char** argv){
         2. GLOBAL data structure is needed to know two things
             a. the index of the first source
             b. how many edges with that source (so I don't have to calculate how many times to iterate later)
+
+            2.1: Should it be completely visible to all ranks? (need to be broadcasted)
+            2.2: Or simply use distributed data structure ygm::map?
         
         3. (optional) Using sorted Edge list for matrix B. Must be tested whether this brings performance boost.
 
@@ -150,31 +170,37 @@ int main(int argc, char** argv){
     */
 
     ygm::container::map<int, edge_info> edge_book(world); // source, <first index, edge count>
+    static ygm::container::map<int, edge_info> &s_edge_book = edge_book;
     ygm::container::array<Edge> matrix_A(world, bag_A);
-    matrix_A.sort(); // Globally sort matrix A
+    static ygm::container::array<Edge> &s_matrix_A = matrix_A;
     ygm::container::array<Edge> matrix_B(world, bag_B); // BOOKMARK: Sort matrix B later
+    static ygm::container::array<Edge> &s_matrix_B = matrix_B;
     // deallocate bag_A and bag_B
+    world.barrier();
+    matrix_A.sort(); // Globally sort matrix A
     bag_A.clear();
     bag_B.clear();
 
-    matrix_A.for_all([&edge_book](int index, Edge &ed){
+    matrix_A.for_all([](int index, Edge &ed){
 
         // insert if it did not exist before
         // increment the edge count if it has already existed
-        update_edge(edge_book, ed.row, index);
+        update_edge(s_edge_book, ed.row, index);
     });
-    //world.cout("I got ", i, " lines");
+    world.barrier();
 
-    edge_book.for_all([](int src, edge_info &ei){
+    // edge_book.for_all([](int src, edge_info &ei){
 
-        s_world.cout("Source: ", src, ", first index: ", ei.first_index, ", number of edges with the source: ", ei.edge_count);
-    });
+    //     s_world.cout("Source: ", src, ", first index: ", ei.first_index, ", number of edges with the source: ", ei.edge_count); 
+    // });
+
     /*
         Task 3: matrix C data structure
 
         1. Naive implementation: use ygm::map
     */
-   ygm::container::map<coordinate, int> matrix_C(world);  // <row, col>, partial product 
+    ygm::container::map<std::pair<int, int>, int> matrix_C(world);  // <row, col>, partial product 
+    static ygm::container::map<std::pair<int, int>, int> &s_matrix_C = matrix_C;
 
     /*
         Task 4: perform outer product multiplication
@@ -185,27 +211,132 @@ int main(int argc, char** argv){
         
     */
 
-    matrix_B.for_all([&matrix_A](int index, Edge &ed){
 
-        int column_B = ed.col;
-        int first_index;
+    // Question: using & vs static.
+    static int mat_A_size = matrix_A.size();
 
-        // auto multiplier = [](int index, Edge &ed, int ){
+    matrix_B.for_all([](int index, Edge &ed){
 
-        // };
+        int column_B = ed.col; // need a matching row (source)
+        // but what if there is no matching row?
+        int row_B = ed.row;
+        int value_B = ed.value;
+        auto getIndex = [](int source, edge_info &ei, int value_B, int row_B){
+            int src_index = ei.first_index;
+            int src_edge_count = ei.edge_count;
 
-        //matrix_A.async_visit();
+            auto multiplier = [](int index, Edge &ed, int value_B, int row_B){
+                int partial_product = value_B * ed.value; // valueB * valueA;
+ 
+                /*
+                    Task 5: Storing the partial products
+
+                    1. How to store partial products?
+                        a. create a linked list off the same key
+                        b. use mapped_reduce() if the key already exists (overwriting)
+                */
+               s_matrix_C.async_insert({row_B, ed.col}, 0);
+               auto adder = [](std::pair<int, int> coord, int &partial_product, int value_add){
+                    if(value_add > 0){ // to count triangle
+                        partial_product++;
+                    }
+                    //partial_product += value_add;
+               };
+                s_matrix_C.async_visit(std::make_pair(row_B, ed.col), adder, partial_product); // Boost's hasher complains if I use a struct
+            };
+
+            // int i is getting corrupted somehow (going to crazy higher number like 98758)
+            for(int i = 0; i < src_edge_count; i++){
+                if(src_index + i >= mat_A_size){
+                    cout << "src: " << ei.first_index << ", edge_count: " << ei.edge_count << endl;
+                    return;
+                }
+                s_matrix_A.async_visit(src_index + i, multiplier, value_B, row_B); // async_visit_if_contains does not work??
+            }
+        };
+
+        // s_world.cout("looking into edge book");
+        s_edge_book.async_visit_if_contains(column_B, getIndex, value_B, row_B); 
+
     });
 
-    /*
-        Task 5: Storing the partial products
+    world.barrier();
 
-        1. How to store partial products?
-            a. create a linked list off the same key
-            b. use mapped_reduce() if the key already exists (overwriting)
-    */
+    // matrix_C.for_all([](std::pair<int, int> coord, int product){
+    //     s_world.cout(coord.first, ", ", coord.second, ": ", product);
+    // });
+
+    ygm::container::map<std::pair<int, int>, int> matrix_D(world);  // <row, col>, partial product 
+    static ygm::container::map<std::pair<int, int>, int> &s_matrix_D = matrix_D;
+
+    matrix_C.for_all([](std::pair<int, int> coord, int product){
+         int column_C = coord.second; // need a matching row (source)
+        // but what if there is no matching row?
+        int row_C = coord.first;
+        int value_C = product;
+        auto getIndex = [](int source, edge_info &ei, int value_C, int row_C){
+            int src_index = ei.first_index;
+            int src_edge_count = ei.edge_count;
+
+            auto multiplier = [](int index, Edge &ed, int value_C, int row_C){
+                int partial_product = value_C * ed.value; // valueB * valueA;
+               
+                s_matrix_D.async_insert({row_C, ed.col}, 0);
+                auto adder = [](std::pair<int, int> coord, int &partial_product, int value_add){
+                    if(value_add > 0){ // to count triangle
+                        partial_product++;
+                    }
+                    //partial_product += value_add;
+                };
+                s_matrix_D.async_visit(std::make_pair(row_C, ed.col), adder, partial_product);
+            };
+
+            // int i is getting corrupted somehow (going to crazy higher number like 98758)
+            for(int i = 0; i < src_edge_count; i++){
+                if(src_index + i >= mat_A_size){
+                    cout << "src: " << ei.first_index << ", edge_count: " << ei.edge_count << endl;
+                    return;
+                }
+                s_matrix_A.async_visit(src_index + i, multiplier, value_C, row_C); // async_visit_if_contains does not work??
+            }
+        };
+
+        // s_world.cout("looking into edge book");
+        s_edge_book.async_visit_if_contains(column_C, getIndex, value_C, row_C); 
+    });
+
+    world.barrier();
+
+    //  matrix_D.for_all([](std::pair<int, int> coord, int product){
+    //     s_world.cout(coord.first, ", ", coord.second, ": ", product);
+    // });
+
+
+    int local_sum = 0;
+    matrix_D.for_all([&local_sum](std::pair<int, int> coord, int product){
+        if(coord.first == coord.second){
+            local_sum += product;
+        }
+    });
+
+    int global_sum = world.all_reduce_sum(local_sum);
+
+    world.cout0(global_sum / 6, " triangle(s)");
 
 
 
-
+    return 0;
 }
+
+
+
+/*
+    Errors encountered:
+        1. segmentation fault
+        Solution: creating a static object that refer to the ygm containers.
+        2. Attempting to use an MPI routine after finalizing MPICH 
+              what():   !m_in_process_receive_queue /g/g14/choi26/SpGEMM_Project/build/_deps/ygm-src/include/ygm/detail/comm.ipp:1433 
+        Solution: static objects live until program exit and the world (ygm::comm) is destroyed before the containers are destroyed
+            
+
+*/
