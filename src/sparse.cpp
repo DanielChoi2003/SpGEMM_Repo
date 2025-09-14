@@ -8,7 +8,6 @@
 
 using std::cout, std::endl;
 
-
 struct Edge{
     int row;
     int col;
@@ -26,40 +25,62 @@ struct Edge{
     }
 };
 
-// struct coordinate{
-//     int row;
-//     int col;
-
-//     template <class Archive>
-//     void serialize( Archive & ar )
-//     {
-//         ar(row, col);
-//     }
-// };
-
-struct edge_info{
+struct metadata{
+    int src = -69;
     int first_index = -1;
     int edge_count = 0;
 
     template <class Archive>
     void serialize( Archive & ar )
     {
-        ar(first_index, edge_count);
+        ar(src, first_index, edge_count);
+    }
+
+    bool operator<(const metadata& mt) const
+    {
+        if(src != mt.src){
+            return src < mt.src;
+        }
+        else if(first_index != mt.first_index){
+            return first_index < mt.first_index;
+        }
+        
+        return edge_count < mt.edge_count;
     }
 };
 
-using graph_type = ygm::container::map<int, edge_info>;
+int getIndex(int source, std::vector<metadata> vec, int startIndex){
+    // binary search
+
+    // get the middle index
+    int middle = vec.size() / 2;
+    // base case
+    if(vec.at(middle).src == source){
+        return startIndex + middle;
+    }
+
+    if(source < vec.at(middle).src){
+        return getIndex(source, std::vector(vec.begin(), vec.begin() + middle), startIndex);
+    }
+    else if(source > vec.at(middle).src){
+        return getIndex(source, std::vector(vec.begin() + middle, vec.end()), startIndex + middle); // middle inclusive
+    }
+
+    return -1;
+}
+
+using graph_type = ygm::container::array<metadata>;
 
 // first adds edge by setting the index of the first occurring source, then increments the edge count to 1
 // if not the first not, it only increments the edge count
 void update_edge(graph_type& graph, int src,
               int index) {
 
-  auto updater = [](int src, edge_info& ei, int index) {
-    if(ei.first_index == -1){ // first occurrence
-        ei.first_index = index;
+  auto updater = [](int src, metadata& mt, int index) {
+    if(mt.first_index == -1){ // first occurrence
+        mt.first_index = index;
     }
-    ei.edge_count++;
+    mt.edge_count++;
   };
 
   graph.async_visit(src, updater, index); // creates an entry if it did not exist
@@ -113,7 +134,7 @@ int main(int argc, char** argv){
 
      // Task 1: data extraction
     ygm::container::bag<Edge> bag_A(world);
-    std::vector<std::string> filename_A = {"../data/matrix_data/as-caida.csv"};
+    std::vector<std::string> filename_A = {"../data/matrix_data/10x10.csv"};
     ygm::io::csv_parser parser_A(world, filename_A);
     parser_A.for_all([&](ygm::io::detail::csv_line line){ // currently rank 0 is the only one running. is byte partition fixed?
 
@@ -122,7 +143,9 @@ int main(int argc, char** argv){
         int value = line[2].as_integer();
         // long long vertex_one = std::min(vertex_a, vertex_b);
         // long long vertex_two = std::max(vertex_a, vertex_b);
-        
+        if(!world.rank0()){
+            world.cout(value);
+        }
         Edge ed = {row, col, value};
         bag_A.async_insert(ed);
     });
@@ -130,7 +153,7 @@ int main(int argc, char** argv){
 
     // matrix B data extraction
     ygm::container::bag<Edge> bag_B(world);
-    std::vector<std::string> filename_B = {"../data/matrix_data/as-caida.csv"};
+    std::vector<std::string> filename_B = {"../data/matrix_data/10x10.csv"};
     ygm::io::csv_parser parser_B(world, filename_B);
     parser_B.for_all([&](ygm::io::detail::csv_line line){
 
@@ -164,13 +187,22 @@ int main(int argc, char** argv){
 
         Questions: 
             1. Is there a better way to partition csv data among ranks than inserting them into a bag then into an array?
+
             2. How does array globally sort? similar to merge sort?
+                pivot sort -> prefix sum
             3. Currently, only rank 1 is performing the csv parse. Is it because due to byte fixed partitioning?
+                answer: 8 MB chunk partitioning. heavy on system. 9MB -> 8MB, 1MB
             4. how to deallocate the bag containers?
+                answer: use a scope
+            5. what test method to confirm the correctness?
+                create unit test cases in matlab or numpy
+            6. how does csv_parser perform partition?
+            7. async_visit_if_contain() seems to not work on ygm::array 
+                no it does not. Used for ygm::map
+
     */
 
-    ygm::container::map<int, edge_info> edge_book(world); // source, <first index, edge count>
-    static ygm::container::map<int, edge_info> &s_edge_book = edge_book;
+    static std::vector<metadata> mat_metadata;
     ygm::container::array<Edge> matrix_A(world, bag_A);
     static ygm::container::array<Edge> &s_matrix_A = matrix_A;
     ygm::container::array<Edge> matrix_B(world, bag_B); // BOOKMARK: Sort matrix B later
@@ -178,21 +210,75 @@ int main(int argc, char** argv){
     // deallocate bag_A and bag_B
     world.barrier();
     matrix_A.sort(); // Globally sort matrix A
-    bag_A.clear();
+    bag_A.clear(); // deallocates majority.
     bag_B.clear();
+    /*
 
-    matrix_A.for_all([](int index, Edge &ed){
+        vector data;
+        data.clear();
+        {
+            vector newVec;
+            data.swap(newVec);
+        }
 
-        // insert if it did not exist before
-        // increment the edge count if it has already existed
-        update_edge(s_edge_book, ed.row, index);
+        //data.shrink_to_fit();
+    */
+
+    /*
+        Perhaps have each rank perform only calculation on their own before sending the data to rank 0 to save time
+    */
+    static std::vector<metadata> local_metadata;
+    static std::vector<metadata> global_metadata;
+    int cur_pos = 0;
+    matrix_A.for_all([&cur_pos](int index, Edge &ed){
+        if(local_metadata.empty()){
+            local_metadata.push_back({ed.row, index, 1});
+        }
+        else if(local_metadata.at(cur_pos).src != ed.row){
+            local_metadata.push_back({ed.row, index, 1});
+            cur_pos++;
+        }
+        else{ // the row number matches
+            local_metadata.at(cur_pos).edge_count++;
+        }
     });
     world.barrier();
+    
+    auto merger = [](std::vector<metadata> indiv_metadata){
+        // rank 0 may be sending the same local data to itself (if merging it into local_metadata)
+        global_metadata.insert(global_metadata.end(), indiv_metadata.begin(), indiv_metadata.end()); 
+    };
+    s_world.async(0, merger, local_metadata);
+    world.barrier();
 
-    // edge_book.for_all([](int src, edge_info &ei){
+    if(world.rank0()){
+        // merge the same source information
+        int first_index = 0;
+        int current_src = -1; // assuming there is no source of -1
+        for(size_t i = 0; i < global_metadata.size(); ){
+            if(current_src == -1 || current_src != global_metadata.at(i).src){ 
+                current_src = global_metadata.at(i).src;
+                first_index = i;
+                i++; // only move onto the next element if we did not erase an element
+            }
+            else if(current_src == global_metadata.at(i).src){
+                global_metadata.at(first_index).edge_count += global_metadata.at(i).edge_count;
+                global_metadata.erase(global_metadata.begin() + i);
+            }
+        }
 
-    //     s_world.cout("Source: ", src, ", first index: ", ei.first_index, ", number of edges with the source: ", ei.edge_count); 
-    // });
+        std::sort(global_metadata.begin(), global_metadata.end());
+        s_world.async_bcast([](std::vector<metadata> sorted_metadata){
+            global_metadata = sorted_metadata;
+        }, global_metadata);
+    }
+    world.barrier();
+    // if(world.rank0()){
+    //     for(auto &mt : global_metadata){
+    //         printf("source/row number: %d, first index: %d, edge count: %d\n", mt.src, mt.first_index, mt.edge_count);
+    //     }
+    // }
+        
 
     /*
         Task 3: matrix C data structure
@@ -215,15 +301,23 @@ int main(int argc, char** argv){
     // Question: using & vs static.
     static int mat_A_size = matrix_A.size();
 
-    matrix_B.for_all([](int index, Edge &ed){
+    // binary search unit test
+    // std::vector<metadata> vec = {{1, 0, 3}, {2, 3, 6}, {3, 9, 3}, {5, 7, 1}, {8, 0, 2}, {7, 3, 2}};
+    // if(world.rank0()){
+    //     int index = getIndex(5, vec, 0);
+    //     printf("index: %d\n", index);
+    // }
 
+    matrix_B.for_all([](int index, Edge &ed){
         int column_B = ed.col; // need a matching row (source)
         // but what if there is no matching row?
         int row_B = ed.row;
         int value_B = ed.value;
-        auto getIndex = [](int source, edge_info &ei, int value_B, int row_B){
-            int src_index = ei.first_index;
-            int src_edge_count = ei.edge_count;
+        int rowA_index = -1;
+        if((rowA_index = getIndex(column_B, global_metadata, 0)) != -1){ // found a matching row in matrix A
+            int src = global_metadata.at(rowA_index).src;
+            int src_edge_count = global_metadata.at(rowA_index).edge_count;
+            int start_index = global_metadata.at(rowA_index).first_index;
 
             auto multiplier = [](int index, Edge &ed, int value_B, int row_B){
                 int partial_product = value_B * ed.value; // valueB * valueA;
@@ -237,93 +331,26 @@ int main(int argc, char** argv){
                 */
                s_matrix_C.async_insert({row_B, ed.col}, 0);
                auto adder = [](std::pair<int, int> coord, int &partial_product, int value_add){
-                    if(value_add > 0){ // to count triangle
-                        partial_product++;
-                    }
-                    //partial_product += value_add;
+                    partial_product += value_add;
                };
                 s_matrix_C.async_visit(std::make_pair(row_B, ed.col), adder, partial_product); // Boost's hasher complains if I use a struct
-            };
-
-            // int i is getting corrupted somehow (going to crazy higher number like 98758)
+            };           
             for(int i = 0; i < src_edge_count; i++){
-                if(src_index + i >= mat_A_size){
-                    cout << "src: " << ei.first_index << ", edge_count: " << ei.edge_count << endl;
+                if(start_index + i >= mat_A_size){
+                    cout << "src: " << src << ", edge_count: " << src_edge_count << endl;
                     return;
                 }
-                s_matrix_A.async_visit(src_index + i, multiplier, value_B, row_B); // async_visit_if_contains does not work??
+                s_matrix_A.async_visit(start_index + i, multiplier, value_B, row_B); // async_visit_if_contains does not work??
             }
-        };
-
-        // s_world.cout("looking into edge book");
-        s_edge_book.async_visit_if_contains(column_B, getIndex, value_B, row_B); 
-
-    });
-
-    world.barrier();
-
-    // matrix_C.for_all([](std::pair<int, int> coord, int product){
-    //     s_world.cout(coord.first, ", ", coord.second, ": ", product);
-    // });
-
-    ygm::container::map<std::pair<int, int>, int> matrix_D(world);  // <row, col>, partial product 
-    static ygm::container::map<std::pair<int, int>, int> &s_matrix_D = matrix_D;
-
-    matrix_C.for_all([](std::pair<int, int> coord, int product){
-         int column_C = coord.second; // need a matching row (source)
-        // but what if there is no matching row?
-        int row_C = coord.first;
-        int value_C = product;
-        auto getIndex = [](int source, edge_info &ei, int value_C, int row_C){
-            int src_index = ei.first_index;
-            int src_edge_count = ei.edge_count;
-
-            auto multiplier = [](int index, Edge &ed, int value_C, int row_C){
-                int partial_product = value_C * ed.value; // valueB * valueA;
-               
-                s_matrix_D.async_insert({row_C, ed.col}, 0);
-                auto adder = [](std::pair<int, int> coord, int &partial_product, int value_add){
-                    if(value_add > 0){ // to count triangle
-                        partial_product++;
-                    }
-                    //partial_product += value_add;
-                };
-                s_matrix_D.async_visit(std::make_pair(row_C, ed.col), adder, partial_product);
-            };
-
-            // int i is getting corrupted somehow (going to crazy higher number like 98758)
-            for(int i = 0; i < src_edge_count; i++){
-                if(src_index + i >= mat_A_size){
-                    cout << "src: " << ei.first_index << ", edge_count: " << ei.edge_count << endl;
-                    return;
-                }
-                s_matrix_A.async_visit(src_index + i, multiplier, value_C, row_C); // async_visit_if_contains does not work??
-            }
-        };
-
-        // s_world.cout("looking into edge book");
-        s_edge_book.async_visit_if_contains(column_C, getIndex, value_C, row_C); 
-    });
-
-    world.barrier();
-
-    //  matrix_D.for_all([](std::pair<int, int> coord, int product){
-    //     s_world.cout(coord.first, ", ", coord.second, ": ", product);
-    // });
-
-
-    int local_sum = 0;
-    matrix_D.for_all([&local_sum](std::pair<int, int> coord, int product){
-        if(coord.first == coord.second){
-            local_sum += product;
         }
     });
 
-    int global_sum = world.all_reduce_sum(local_sum);
+    world.barrier();
 
-    world.cout0(global_sum / 6, " triangle(s)");
-
-
+    matrix_C.for_all([](std::pair<int, int> coord, int product){
+        printf("row: %d, column: %d, product: %d\n", coord.first, coord.second, product);
+        //s_world.cout(coord.first, ", ", coord.second, ": ", product);
+    });
 
     return 0;
 }
@@ -338,5 +365,13 @@ int main(int argc, char** argv){
               what():   !m_in_process_receive_queue /g/g14/choi26/SpGEMM_Project/build/_deps/ygm-src/include/ygm/detail/comm.ipp:1433 
         Solution: static objects live until program exit and the world (ygm::comm) is destroyed before the containers are destroyed
             
+        3. Fatal error in PMPI_Test: Message truncated, error stack:
+            PMPI_Test(174)....: MPI_Test(request=0x84cc90, flag=0x7fffffff9f14, status=0x7fffffff9f20) failed
+        
+            occured when trying to merge all the vectors to rank 0
+        Solution: silly mistake. Was sending the vector to rank every iteration
 
+        4. rank 0 outputs -1 for all the src numbers.
+        
+        Solution: did not serialize src in ar(). oops...
 */
